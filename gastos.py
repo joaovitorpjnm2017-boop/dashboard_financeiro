@@ -1,7 +1,14 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import re
+
+# Importações estatísticas
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import adfuller, acf, pacf
 
 # Configuração da página
 st.set_page_config(
@@ -25,7 +32,6 @@ url_input = st.sidebar.text_input(
     help="O link da sua planilha já está configurado. Qualquer alteração feita no Google Sheets será refletida aqui."
 )
 
-# Botão para recarregar os dados novos
 if st.sidebar.button("🔄 Atualizar Dados do Sheets"):
     st.cache_data.clear()
     st.rerun()
@@ -43,7 +49,7 @@ def converter_url_google_sheets(url):
     
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
-@st.cache_data(ttl=300) # Atualiza a cada 5 minutos
+@st.cache_data(ttl=300)
 def carregar_dados_sheets(url_csv):
     try:
         df = pd.read_csv(url_csv)
@@ -98,7 +104,7 @@ if df is not None:
         s_formatted[has_comma] = s[has_comma].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
         return pd.to_numeric(s_formatted, errors='coerce')
 
-    # --- TRATAMENTO DE DATAS EM PORTUGUÊS (Ex: 'terça-feira, 3 de outubro de 2023') ---
+    # --- TRATAMENTO DE DATAS ---
     def tratar_datas(coluna):
         meses_pt = {
             'janeiro': '01', 'fevereiro': '02', 'março': '03', 'marco': '03',
@@ -112,7 +118,6 @@ if df is not None:
                 return pd.NaT
             val_str = str(val).lower().strip()
             
-            # Tenta extrair dia, mês por extenso e ano usando Expressão Regular
             match = re.search(r'(\d{1,2})\s+de\s+([a-zà-ú]+)\s+de\s+(\d{4})', val_str)
             if match:
                 dia, mes_nome, ano = match.groups()
@@ -122,7 +127,6 @@ if df is not None:
                     if not pd.isna(res):
                         return res
             
-            # Tenta conversão padrão (DD/MM/AAAA)
             return pd.to_datetime(val_str, dayfirst=True, errors='coerce')
 
         return coluna.apply(parse_single)
@@ -130,7 +134,6 @@ if df is not None:
     df["_valor_limpo"] = tratar_valores(df[col_valor])
     df["_data_limpa"] = tratar_datas(df[col_data])
 
-    # Base filtrada sem valores nulos em data e valor
     df_base = df.dropna(subset=["_data_limpa", "_valor_limpo"]).copy()
 
     if not df_base.empty:
@@ -158,7 +161,12 @@ if df is not None:
             default=tipos_unicos
         )
 
-        cats_unicas = sorted(df_base[col_cat].dropna().unique().tolist())
+        if tipos_selecionados:
+            df_para_categorias = df_base[df_base[col_tipo].isin(tipos_selecionados)]
+        else:
+            df_para_categorias = df_base.iloc[0:0] 
+
+        cats_unicas = sorted(df_para_categorias[col_cat].dropna().unique().tolist())
         cats_selecionadas = st.sidebar.multiselect(
             "🏷️ Categoria:",
             options=cats_unicas,
@@ -180,7 +188,6 @@ if df is not None:
         else:
             faixa_valor = (val_min_base, val_max_base)
 
-        # Aplicação dos Filtros
         if isinstance(periodo_selecionado, (list, tuple)) and len(periodo_selecionado) == 2:
             dt_ini, dt_fim = periodo_selecionado
             cond_data = (df_base["_data_limpa"].dt.date >= dt_ini) & (df_base["_data_limpa"].dt.date <= dt_fim)
@@ -244,8 +251,8 @@ if df is not None:
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown("### 🏷️ Gastos por Categoria")
-                    st.bar_chart(df_filtrado[col_cat].value_counts())
+                    st.markdown("### 🏷️ Top 10 Categorias Mais Frequentes")
+                    st.bar_chart(df_filtrado[col_cat].value_counts().head(10))
                 with c2:
                     st.markdown("### 📌 Gastos por Tipo")
                     st.bar_chart(df_filtrado[col_tipo].value_counts())
@@ -312,9 +319,9 @@ if df is not None:
             else:
                 st.warning("Nenhum dado disponível para a Análise Mensal com os filtros atuais.")
 
-        # --- ABA 4: ANÁLISE SEMANAL ---
+        # --- ABA 4: ANÁLISE SEMANAL E SÉRIES TEMPORAIS ---
         with aba_semanal:
-            st.subheader("🗓️ Análise Semanal dos Gastos")
+            st.subheader("🗓️ Análise Semanal e Séries Temporais")
 
             if not df_filtrado.empty:
                 df_filtrado["Semana_Num"] = ((df_filtrado["_data_limpa"].dt.day - 1) // 7) + 1
@@ -389,48 +396,126 @@ if df is not None:
 
                 st.divider()
 
-                st.markdown("### 📊 Valor Acumulado Total em Cada Semana")
-                fig_barras = px.bar(
-                    df_semana_acumulado,
-                    x="Semana_Nome",
-                    y="Total Gasto",
-                    text="Total Gasto",
-                    title="Total Acumulado por Semana (Semanas 1 a 5)",
-                    labels={
-                        "Semana_Nome": "Semana do Mês",
-                        "Total Gasto": "Valor Acumulado (R$)"
-                    },
-                    color="Semana_Nome",
-                    color_discrete_sequence=px.colors.qualitative.Pastel,
-                    category_orders={"Semana_Nome": ordem_semanas}
+                # =========================================================
+                # DECOMPOSIÇÃO E ANÁLISE DE SÉRIES TEMPORAIS TRANSFORMADAS
+                # =========================================================
+                st.markdown("## 🔍 Decomposição Estatística com Transformação Logarítmica e Diferenciação")
+
+                # 1. Série temporal agregada por semana
+                ts_semanal = (
+                    df_filtrado.set_index("_data_limpa")
+                    .resample("W")["_valor_limpo"]
+                    .sum()
+                    .fillna(0)
                 )
 
-                fig_barras.update_traces(
-                    textposition="outside",
-                    texttemplate="R$ %{y:,.2f}"
-                )
-                fig_barras.update_layout(
-                    yaxis_tickprefix="R$ ",
-                    showlegend=False,
-                    xaxis=dict(type='category')
-                )
+                # 2. Aplicação da Transformação Logarítmica: log(1 + X)
+                ts_log = np.log1p(ts_semanal)
 
-                st.plotly_chart(fig_barras, use_container_width=True)
+                # 3. Aplicação da Primeira Diferença: Δ log(1 + X_t) = log(1 + X_t) - log(1 + X_{t-1})
+                ts_diff = ts_log.diff().dropna()
 
-                st.divider()
+                if len(ts_diff) >= 12:
+                    periodo_sazonal = 4 # Ciclo de 4 semanas
+                    decomposicao = seasonal_decompose(ts_diff, model="additive", period=periodo_sazonal)
 
-                st.markdown("### 📄 Tabela Detalhada (Gastos por Mês x Semana)")
-                df_pivot = df_semana_mes.pivot(
-                    index="Ano_Mes_Texto", 
-                    columns="Semana_Nome", 
-                    values="Total Gasto"
-                ).fillna(0)
+                    # Subplots da decomposição
+                    fig_decomp = make_subplots(
+                        rows=4, cols=1,
+                        shared_xaxes=True,
+                        subplot_titles=(
+                            "Série Transformada & Diferenciada: Δ log(1 + X)", 
+                            "Tendência da Série Transformada", 
+                            "Sazonalidade (Ciclo Mensal de 4 Semanas)", 
+                            "Ruído / Resíduos"
+                        )
+                    )
 
-                cols_presentes = [c for c in ordem_semanas if c in df_pivot.columns]
-                df_pivot = df_pivot.reindex(index=meses_ordenados)[cols_presentes]
+                    fig_decomp.add_trace(go.Scatter(x=ts_diff.index, y=decomposicao.observed, name="Observado (Transformado)", line=dict(color="#1f77b4")), row=1, col=1)
+                    fig_decomp.add_trace(go.Scatter(x=ts_diff.index, y=decomposicao.trend, name="Tendência", line=dict(color="#ff7f0e", width=2.5)), row=2, col=1)
+                    fig_decomp.add_trace(go.Scatter(x=ts_diff.index, y=decomposicao.seasonal, name="Sazonalidade", line=dict(color="#2ca02c")), row=3, col=1)
+                    fig_decomp.add_trace(go.Scatter(x=ts_diff.index, y=decomposicao.resid, name="Ruído", mode="markers", marker=dict(color="#d62728", size=5)), row=4, col=1)
 
-                df_pivot_fmt = df_pivot.apply(lambda col: col.map(formatar_moeda))
-                st.dataframe(df_pivot_fmt, use_container_width=True)
+                    fig_decomp.update_layout(
+                        height=800,
+                        showlegend=False,
+                        title_text="Decomposição da Série Temporal Transformada (Log + 1ª Diferença)"
+                    )
+                    st.plotly_chart(fig_decomp, use_container_width=True)
+
+                    st.divider()
+
+                    # Gráficos de Autocorrelação (ACF e PACF da série transformada)
+                    st.markdown("### 📊 Autocorrelação da Série Transformada (ACF e PACF)")
+                    c_acf, c_pacf = st.columns(2)
+
+                    nlags = min(20, len(ts_diff) // 2 - 1)
+                    acf_vals = acf(ts_diff, nlags=nlags)
+                    pacf_vals = pacf(ts_diff, nlags=nlags)
+
+                    with c_acf:
+                        fig_acf = px.bar(
+                            x=list(range(len(acf_vals))),
+                            y=acf_vals,
+                            labels={"x": "Lags (Semanas)", "y": "Autocorrelação"},
+                            title="ACF - Série Transformada [Δ log(1 + X)]"
+                        )
+                        fig_acf.update_traces(marker_color="#1f77b4")
+                        st.plotly_chart(fig_acf, use_container_width=True)
+
+                    with c_pacf:
+                        fig_pacf = px.bar(
+                            x=list(range(len(pacf_vals))),
+                            y=pacf_vals,
+                            labels={"x": "Lags (Semanas)", "y": "Autocorrelação Parcial"},
+                            title="PACF - Série Transformada [Δ log(1 + X)]"
+                        )
+                        fig_pacf.update_traces(marker_color="#ff7f0e")
+                        st.plotly_chart(fig_pacf, use_container_width=True)
+
+                    st.divider()
+
+                    # Teste ADF na série transformada
+                    st.markdown("### 🧪 Teste de Dickey-Fuller Aumentado na Série Transformada")
+                    
+                    adf_resultado = adfuller(ts_diff)
+                    adf_stat = adf_resultado[0]
+                    p_valor = adf_resultado[1]
+                    crit_vals = adf_resultado[4]
+
+                    col_adf1, col_adf2, col_adf3 = st.columns(3)
+                    col_adf1.metric("Estatística ADF", f"{adf_stat:.4f}")
+                    col_adf2.metric("p-valor", f"{p_valor:.4f}")
+                    
+                    is_estacionaria = p_valor < 0.05
+                    col_adf3.metric(
+                        "Status de Estacionariedade", 
+                        "Estacionária" if is_estacionaria else "Não-Estacionária",
+                        delta="Média e Variância Estáveis" if is_estacionaria else "Requer Maior Diferenciação",
+                        delta_color="normal" if is_estacionaria else "inverse"
+                    )
+
+                    with st.expander("ℹ️ Detalhes e Interpretação do Teste na Série Transformada"):
+                        st.write(r"**Equação Aplicada:** $Y^*_t = \ln(1 + X_t) - \ln(1 + X_{t-1})$")
+                        st.write(f"**Hipótese Nula (H0):** A série transformada possui raiz unitária (Não-Estacionária).")
+                        st.write(f"**Hipótese Alternativa (H1):** A série transformada é Estacionária.")
+                        
+                        if is_estacionaria:
+                            st.success(
+                                f"Com p-valor de **{p_valor:.4f}** (menor que 0.05), **rejeitamos a hipótese nula**. "
+                                f"Após aplicar a transformação logarítmica e a 1ª diferença, a série tornou-se **estacionária**, com média e variância estabilizadas."
+                            )
+                        else:
+                            st.warning(
+                                f"Com p-valor de **{p_valor:.4f}** (maior ou igual a 0.05), **não rejeitamos a hipótese nula**. "
+                                f"A série ainda apresenta comportamentos não-estacionários."
+                            )
+
+                        st.write("**Valores Críticos de Rejeição:**")
+                        st.json({k: round(v, 4) for k, v in crit_vals.items()})
+
+                else:
+                    st.info("Selecione um período com pelo menos 12 semanas para gerar a análise de série temporal transformada.")
 
             else:
                 st.warning("Nenhum dado disponível para a Análise Semanal com os filtros atuais.")
